@@ -1,0 +1,103 @@
+rules_version = '2';
+
+// Deploy these in the Firebase Console:
+// Firestore Database -> Rules -> paste this -> Publish
+//
+// SECURITY MODEL (updated in the security-hardening pass):
+// - Admin status is checked by READING the requesting user's own
+//   /users/{uid} document and confirming role == "admin". A user can never
+//   write their own role (see the users rules below), so this cannot be
+//   forged from the client.
+// - Order creation, payment verification, and stock/coupon changes now
+//   happen ONLY through server-side Firebase Admin SDK code (the /api
+//   functions), which bypasses these rules entirely. That's intentional —
+//   it's how the server is able to be authoritative about price, stock,
+//   and coupon validity. These rules exist to lock down what's left:
+//   direct client reads/writes via the Firestore Web SDK.
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isAdmin() {
+      return isSignedIn() &&
+        exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin';
+    }
+
+    function isOwner(existingData) {
+      return isSignedIn() && existingData.uid == request.auth.uid;
+    }
+
+    match /orders/{orderId} {
+      // Orders are only ever CREATED by the server (Admin SDK), which
+      // bypasses rules — so client-side create is fully disabled here.
+      allow create: if false;
+
+      // A signed-in customer can read only their own orders (queried by
+      // uid — see OrderContext.jsx). An admin can read everything. Guests
+      // never list the collection at all; they use /api/get-order.js for
+      // a single order lookup instead (that endpoint requires the order's
+      // email or phone as a second factor).
+      allow get, list: if isAdmin() || isOwner(resource.data);
+
+      // Only admins may update orders directly. Customers CANNOT — not
+      // even to cancel their own order, and not even status-only.
+      //
+      // Why: cancelling must also restore book stock and (for paid orders)
+      // issue a Razorpay refund. Both are server-side operations. If a
+      // customer could flip status -> 'cancelled' directly from the browser
+      // console, they'd skip both: stock would stay decremented and the
+      // refund would never happen. Customer cancellation therefore goes
+      // exclusively through POST /api/cancel-order, which verifies
+      // ownership, restores stock, and refunds — all atomically, using the
+      // Admin SDK (which bypasses these rules by design).
+      allow update: if isAdmin();
+
+      allow delete: if false;
+    }
+
+    match /store_books/{bookId} {
+      // The catalog is public — every visitor needs to browse it.
+      allow read: if true;
+
+      // Only admins can create/edit/delete books directly. (Stock is also
+      // adjusted by server-side order/cancel logic via the Admin SDK, which
+      // bypasses this rule the same way order creation does.)
+      allow create, update, delete: if isAdmin();
+    }
+
+    match /coupons/{couponCode} {
+      // Checkout needs to read active codes to show a live preview — final
+      // validation always happens again, authoritatively, on the server.
+      allow read: if true;
+
+      // Only admins manage coupons directly. usageCount is only ever
+      // incremented by the server (Admin SDK) after a real order uses the
+      // code — the client can never touch it.
+      allow create, update, delete: if isAdmin();
+
+      match /redemptions/{userKey} {
+        // Per-user redemption records are written only by the server.
+        allow read, write: if false;
+      }
+    }
+
+    match /users/{userId} {
+      // A user can only ever read/write their OWN profile, and can never
+      // set or change their own role — that's a manual step done in this
+      // console (Firestore -> users -> find the document -> change the
+      // role field), never something the app itself can grant.
+      allow create: if isSignedIn()
+                    && request.auth.uid == userId
+                    && request.resource.data.role == 'user';
+      allow read: if isSignedIn() && request.auth.uid == userId;
+      allow update: if isSignedIn()
+                    && request.auth.uid == userId
+                    && request.resource.data.role == resource.data.role;
+      allow delete: if false;
+    }
+  }
+}

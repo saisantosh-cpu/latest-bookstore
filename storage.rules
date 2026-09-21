@@ -1,0 +1,28 @@
+rules_version = '2';
+
+// Deploy these in the Firebase Console:
+// Storage -> Rules (this is a SEPARATE screen from Firestore's Rules tab —
+// easy to paste into the wrong one by mistake).
+//
+// Admin status is verified the same way as in firestore.rules: by reading
+// the requester's own /users/{uid} Firestore document and checking
+// role == "admin". A user can never write their own role (see
+// firestore.rules), so this can't be forged from the client.
+service firebase.storage {
+  match /b/{bucket}/o {
+    match /book-covers/{fileName} {
+      // Cover images are public — every visitor needs to see them.
+      allow read: if true;
+
+      // Only a signed-in admin may upload/replace/delete a cover image.
+      // File size and type are enforced here too — never rely on the
+      // browser's <input accept> attribute alone, since that's trivial to
+      // bypass from outside the app.
+      allow write: if request.auth != null
+                   && firestore.exists(/databases/(default)/documents/users/$(request.auth.uid))
+                   && firestore.get(/databases/(default)/documents/users/$(request.auth.uid)).data.role == 'admin'
+                   && request.resource.size < 5 * 1024 * 1024
+                   && request.resource.contentType.matches('image/(jpeg|png|webp|gif)');
+    }
+  }
+}
